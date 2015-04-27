@@ -20,6 +20,12 @@ select_top_frames=true
 top_frames_threshold=0.16
 bottom_frames_threshold=0.04
 init_vad_model=
+init_speech_model=
+init_sil_model=
+frame_select_threshold=0.9
+use_loglikes_hypothesis=false
+use_latgen=false
+map_opts=
 # End configuration section.
 
 echo "$0 $@"  # Print the command line for logging
@@ -93,9 +99,18 @@ if [ $stage -le -1 ]; then
   diarization/make_vad_graph.sh --iter trans_test $dir/lang_test $dir $dir/graph_test || exit 1
 fi
  
+cat <<EOF > $dir/pdf_to_tid.map
+0 1
+1 3
+EOF
+
 if [ $stage -le 0 ]; then
 mkdir -p $dir/q
 utils/split_data.sh $data $nj || exit 1
+
+map_est=
+[ ! -z "$init_vad_model" ] && map_est="-map"
+[ ! -z "$init_speech_model" ] && map_est="-map"
 
 for n in `seq $nj`; do
   cat <<EOF > $dir/q/do_vad.$n.sh
@@ -110,7 +125,9 @@ while IFS=$'\n' read line; do
   feats="ark:echo \$line | copy-feats scp:- ark:- |"
   utt_id=\$(echo \$line | awk '{print \$1}')
 
-  if [ -z "$init_vad_model" ]; then
+  if [ ! -z "$init_vad_model" ]; then
+    cp $init_vad_model $dir/\$utt_id.0.mdl
+  elif [ -z "$init_speech_model" ] || [ -z "$init_sil_model" ]; then
     if ! $select_top_frames; then
       gmm-global-init-from-feats --num-gauss=$speech_num_gauss --num-iters=10 \
         "\$feats select-voiced-frames ark:- scp:$data/vad.scp ark:- |" \
@@ -120,10 +137,10 @@ while IFS=$'\n' read line; do
         $dir/\$utt_id.silence.0.mdl || exit 1
     else
       gmm-global-init-from-feats --num-gauss=$speech_num_gauss --num-iters=12 \
-        "\$feats select-top-frames --top-frames-proportion=$top_frames_threshold ark:- ark:- |" \
+        "\$feats select-top-chunks --window-size=100 --top-frames-proportion=$top_frames_threshold ark:- ark:- |" \
         $dir/\$utt_id.speech.0.mdl || exit 1
       gmm-global-init-from-feats --num-gauss=$sil_num_gauss --num-iters=8 \
-        "\$feats select-top-frames --bottom-frames-proportion=$bottom_frames_threshold --top-frames-proportion=0.0 ark:- ark:- |" \
+        "\$feats select-top-chunks --window-size=100 --bottom-frames-proportion=$bottom_frames_threshold --top-frames-proportion=0.0 ark:- ark:- |" \
         $dir/\$utt_id.silence.0.mdl || exit 1
     fi
 
@@ -134,21 +151,48 @@ while IFS=$'\n' read line; do
       gmm-global-copy --binary=false $dir/\$utt_id.speech.0.mdl -
     } | gmm-copy - $dir/\$utt_id.0.mdl || exit 1
   else
-    cp $init_vad_model $dir/\$utt_id.0.mdl
+    {
+      cat $dir/trans.mdl
+      echo "<DIMENSION> $feat_dim <NUMPDFS> 2"
+      gmm-global-copy --binary=false $init_speech_model - 
+      gmm-global-copy --binary=false $init_sil_model - 
+    } | gmm-copy - $dir/\$utt_id.0.mdl || exit 1
   fi
 
   x=0
   while [ \$x -lt $num_iters ]; do
-    gmm-decode-simple \
-      --allow-partial=true --word-symbol-table=$dir/graph/words.txt \
-      $dir/\$utt_id.\$x.mdl $dir/graph/HCLG.fst \
-      "\$feats" ark:/dev/null ark:$dir/\$utt_id.\$x.ali || exit 1
+    if $use_loglikes_hypothesis; then
+      gmm-compute-likes $dir/\$utt_id.\$x.mdl "\$feats" ark:- | \
+        loglikes-to-post --min-post=$frame_select_threshold \
+        ark:- "ark:| gzip -c > $dir/\$utt_id.\$x.post.gz" || exit 1
 
-    gmm-acc-stats-ali \
-      $dir/\$utt_id.\$x.mdl "\$feats" \
-      ark:$dir/\$utt_id.\$x.ali - | \
-      gmm-est $dir/\$utt_id.\$x.mdl - $dir/\$utt_id.\$[x+1].mdl \
-      2>&1 | tee $dir/log/update.\$utt_id.\$x.log || exit 1
+      gmm-acc-stats \
+        $dir/\$utt_id.\$x.mdl "\$feats" \
+        "ark:gunzip -c $dir/\$utt_id.\$x.post.gz | copy-post-mapped --id-map=$dir/pdf_to_tid.map ark:- ark:- |" - | \
+        gmm-est${map_est} ${map_opts} --update-flags=mv $dir/\$utt_id.\$x.mdl - $dir/\$utt_id.\$[x+1].mdl \
+        2>&1 | tee $dir/log/update.\$utt_id.\$x.log || exit 1
+    elif $use_latgen; then
+      gmm-latgen-faster --acoustic-scale=1.0 --determinize-lattice=false \
+        $dir/\$utt_id.\$x.mdl $dir/graph/HCLG.fst \
+        "\$feats" "ark:| gzip -c > $dir/\$utt_id.\$x.lat.gz" || exit 1
+
+      lattice-to-post --acoustic-scale=1.0 \
+        "ark:gunzip -c $dir/\$utt_id.\$x.lat.gz |" ark:- | \
+        gmm-acc-stats $dir/\$utt_id.\$x.mdl "\$feats" ark:- - | \
+        gmm-est${map_est} ${map_opts} --update-flags=mv $dir/\$utt_id.\$x.mdl - $dir/\$utt_id.\$[x+1].mdl \
+        2>&1 | tee $dir/log/update.\$utt_id.\$x.log || exit 1
+    else 
+      gmm-decode-simple \
+        --allow-partial=true --word-symbol-table=$dir/graph/words.txt \
+        $dir/\$utt_id.\$x.mdl $dir/graph/HCLG.fst \
+        "\$feats" ark:/dev/null ark:$dir/\$utt_id.\$x.ali || exit 1
+
+      gmm-acc-stats-ali \
+        $dir/\$utt_id.\$x.mdl "\$feats" \
+        ark:$dir/\$utt_id.\$x.ali - | \
+        gmm-est${map_est} ${map_opts} --update-flags=mv $dir/\$utt_id.\$x.mdl - $dir/\$utt_id.\$[x+1].mdl \
+        2>&1 | tee $dir/log/update.\$utt_id.\$x.log || exit 1
+    fi
 
     objf_impr=\$(cat $dir/log/update.\$utt_id.\$x.log | grep "GMM update: Overall .* objective function" | perl -pe 's/.*GMM update: Overall (\S+) objective function .*/\$1/')
     
@@ -160,7 +204,7 @@ while IFS=$'\n' read line; do
   done
 
   rm -f $dir/\$utt_id.final.mdl 2>/dev/null || true
-  cp $dir/\$utt_id.\$x.mdl $dir/\$utt_id.final.mdl 
+  #cp $dir/\$utt_id.\$x.mdl $dir/\$utt_id.final.mdl 
 
   (
   copy-transition-model --binary=false $dir/trans_test.mdl -

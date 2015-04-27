@@ -41,7 +41,14 @@ while (<REF>) {
   my @B = @A[1..$#A];
 
   my $i = 1;
-  my @H = @{$hyps{$A[0]}};
+
+  my @H;
+  
+  if (defined $hyps{$A[0]}) {
+    @H = @{$hyps{$A[0]}};
+  } else {
+    @H = ();
+  }
 
   for ($i=0; $i <= $#B; $i++) {
     if ( ($B[$i] == 1) && ($i <= $#H) && ($H[$i] == 2) ) {
@@ -63,5 +70,5 @@ while (<REF>) {
   }
 
   my $n = scalar @B;
-  print STDOUT $A[0] . " " . scalar @H . " " . scalar @B . " $cor $fp $fn " . sprintf("%6.4f %6.4f %6.4f\n", $cor/$n, $fp/$n, $fn/$n);
+  print STDOUT $A[0] . " " . scalar @B . " " . scalar @H . " $cor $fp $fn " . sprintf("%6.4f %6.4f %6.4f\n", $cor/$n, $fp/$n, $fn/$n);
 }

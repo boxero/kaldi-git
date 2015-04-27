@@ -10,18 +10,15 @@ cmd=run.pl
 nj=4
 speech_duration=75
 sil_duration=30
-speech_num_gauss=16
-sil_num_gauss=4
+speech_max_gauss=12
+sil_max_gauss=4
 num_iters=20
 impr_thres=0.002
 stage=-10
 cleanup=true
-select_top_frames=true
 top_frames_threshold=0.16
 bottom_frames_threshold=0.04
-init_vad_model=
-frame_select_threshold=0.9
-use_loglikes_hypothesis=false
+select_only_voiced_frames=false
 # End configuration section.
 
 echo "$0 $@"  # Print the command line for logging
@@ -61,7 +58,7 @@ for f in $data/feats.scp $data/vad.scp; do
   [ ! -s $f ] && echo "$0: could not find $f or $f is empty" && exit 1
 done 
 
-feat_dim=`feat-to-dim "scp:head -n 1 $data/feats.scp |" ark,t:- | awk '{print $2}'` || exit 1
+feat_dim=`feat-to-dim "ark:head -n 1 $data/feats.scp | add-deltas scp:- ark:- |" ark,t:- | awk '{print $2}'` || exit 1
 
 # Prepare a lang directory
 if [ $stage -le -2 ]; then
@@ -104,6 +101,13 @@ if [ $stage -le 0 ]; then
 mkdir -p $dir/q
 utils/split_data.sh $data $nj || exit 1
 
+select_frames_opts=
+select_sil_frames_opts=
+if $select_only_voiced_frames; then
+  select_frames_opts="select-voiced-frames ark:- scp:$data/vad.scp ark:- |"
+  select_sil_frames_opts="select-voiced-frames --select-unvoiced-frames=true ark:- scp:$data/vad.scp ark:- |"
+fi
+
 for n in `seq $nj`; do
   cat <<EOF > $dir/q/do_vad.$n.sh
 set -e 
@@ -114,82 +118,74 @@ if [ -f path.sh ]; then . ./path.sh; fi
 . parse_options.sh || exit 1;
 
 while IFS=$'\n' read line; do
-  feats="ark:echo \$line | copy-feats scp:- ark:- |"
+  feats="ark:echo \$line | copy-feats scp:- ark:- | add-deltas ark:- ark:- |"
   utt_id=\$(echo \$line | awk '{print \$1}')
 
-  if [ -z "$init_vad_model" ]; then
-    if ! $select_top_frames; then
-      gmm-global-init-from-feats --num-gauss=$speech_num_gauss --num-iters=10 \
-        "\$feats select-voiced-frames ark:- scp:$data/vad.scp ark:- |" \
-        $dir/\$utt_id.speech.0.mdl || exit 1
-      gmm-global-init-from-feats --num-gauss=$sil_num_gauss --num-iters=6 \
-        "\$feats select-voiced-frames --select-unvoiced-frames=true ark:- scp:$data/vad.scp ark:- |" \
-        $dir/\$utt_id.silence.0.mdl || exit 1
-    else
-      gmm-global-init-from-feats --num-gauss=$speech_num_gauss --num-iters=12 \
-        "\$feats select-top-frames --top-frames-proportion=$top_frames_threshold ark:- ark:- |" \
-        $dir/\$utt_id.speech.0.mdl || exit 1
-      gmm-global-init-from-feats --num-gauss=$sil_num_gauss --num-iters=8 \
-        "\$feats select-top-frames --bottom-frames-proportion=$bottom_frames_threshold --top-frames-proportion=0.0 ark:- ark:- |" \
-        $dir/\$utt_id.silence.0.mdl || exit 1
-    fi
+  speech_num_gauss=6
+  sil_num_gauss=2
+  this_top_frames_threshold=$top_frames_threshold
+  this_bottom_frames_threshold=$bottom_frames_threshold
 
-    {
-      cat $dir/trans.mdl
-      echo "<DIMENSION> $feat_dim <NUMPDFS> 2"
-      gmm-global-copy --binary=false $dir/\$utt_id.silence.0.mdl -
-      gmm-global-copy --binary=false $dir/\$utt_id.speech.0.mdl -
-    } | gmm-copy - $dir/\$utt_id.0.mdl || exit 1
-  else
-    cp $init_vad_model $dir/\$utt_id.0.mdl
-  fi
+  gmm-global-init-from-feats --num-gauss=\$speech_num_gauss --num-iters=4 \
+    "\$feats $select_frames_opts select-top-chunks --window-size=10 --frames-proportion=$top_frames_threshold ark:- ark:- |" \
+    $dir/\$utt_id.speech.0.mdl || exit 1
+  gmm-global-init-from-feats --num-gauss=\$sil_num_gauss --num-iters=4 \
+    "\$feats $select_sil_frames_opts select-top-chunks --window-size=10 --select-frames=\$[sil_num_gauss * 20] --select-bottom-frames=true ark:- ark:- |" \
+    $dir/\$utt_id.silence.0.mdl || exit 1
 
   x=0
   while [ \$x -lt $num_iters ]; do
-    if $use_loglikes_hypothesis; then
-      gmm-compute-likes $dir/\$utt_id.\$x.mdl "\$feats" ark:- | \
-        loglikes-to-post --min-post=$frame_select_threshold \
-        ark:- "ark:| gzip -c > $dir/\$utt_id.\$x.post.gz" || exit 1
-
-      gmm-acc-stats \
-        $dir/\$utt_id.\$x.mdl "\$feats" \
-        "ark:gunzip -c $dir/\$utt_id.\$x.post.gz | copy-post-mapped --id-map=$dir/pdf_to_tid.map ark:- ark:- |" - | \
-        gmm-est --update-flags=mv $dir/\$utt_id.\$x.mdl - $dir/\$utt_id.\$[x+1].mdl \
-        2>&1 | tee $dir/log/update.\$utt_id.\$x.log || exit 1
-    else 
-      gmm-decode-simple \
-        --allow-partial=true --word-symbol-table=$dir/graph/words.txt \
-        $dir/\$utt_id.\$x.mdl $dir/graph/HCLG.fst \
-        "\$feats" ark:/dev/null ark:$dir/\$utt_id.\$x.ali || exit 1
-
-      gmm-acc-stats-ali \
-        $dir/\$utt_id.\$x.mdl "\$feats" \
-        ark:$dir/\$utt_id.\$x.ali - | \
-        gmm-est $dir/\$utt_id.\$x.mdl - $dir/\$utt_id.\$[x+1].mdl \
-        2>&1 | tee $dir/log/update.\$utt_id.\$x.log || exit 1
-    fi
-
-    objf_impr=\$(cat $dir/log/update.\$utt_id.\$x.log | grep "GMM update: Overall .* objective function" | perl -pe 's/.*GMM update: Overall (\S+) objective function .*/\$1/')
     
-    if [ "\$(perl -e "if (\$objf_impr < $impr_thres) { print true; }")" == true ]; then
-      break;
+    if [ \$speech_num_gauss -le $speech_max_gauss ]; then
+      speech_num_gauss=\$[speech_num_gauss + 2]
     fi
 
+    if [ \$sil_num_gauss -le $sil_max_gauss ]; then
+      sil_num_gauss=\$[sil_num_gauss + 1]
+    fi
+
+    #this_top_frames_threshold=1.0
+    #this_bottom_frames_threshold=1.0
+    this_top_frames_threshold=\$(perl -e "if (\$this_top_frames_threshold < 0.8) { print \$this_top_frames_threshold * 2 } else { print \$this_top_frames_threshold }")
+    this_bottom_frames_threshold=\$(perl -e "if (\$this_bottom_frames_threshold < 0.8) { print \$this_bottom_frames_threshold * 2 } else { print \$this_bottom_frames_threshold }")
+
+
+    gmm-global-get-frame-likes $dir/\$utt_id.speech.\$x.mdl \
+      "\$feats" ark:$dir/\$utt_id.speech_likes.\$x.ark || exit 1
+
+    gmm-global-get-frame-likes $dir/\$utt_id.silence.\$x.mdl \
+      "\$feats" ark:$dir/\$utt_id.silence_likes.\$x.ark || exit 1
+
+    loglikes-to-class ark:$dir/\$utt_id.silence_likes.\$x.ark ark:$dir/\$utt_id.speech_likes.\$x.ark \
+      ark:$dir/\$utt_id.vad.\$x.ark || exit 1
+
+    gmm-global-acc-stats $dir/\$utt_id.speech.\$x.mdl \
+      "\$feats select-voiced-frames ark:- ark:$dir/\$utt_id.vad.\$x.ark ark:- | select-top-chunks --window-size=10 --frames-proportion=\$this_top_frames_threshold ark:- ark:- |" - | \
+      gmm-global-est --mix-up=\$speech_num_gauss $dir/\$utt_id.speech.\$x.mdl \
+      - $dir/\$utt_id.speech.\$[x+1].mdl || exit 1
+
+    gmm-global-acc-stats $dir/\$utt_id.silence.\$x.mdl \
+      "\$feats select-voiced-frames --select-unvoiced-frames=true ark:- ark:$dir/\$utt_id.vad.\$x.ark ark:- | select-top-chunks --window-size=10 --select-frames=\$[sil_num_gauss * 40] --select-bottom-frames=true ark:- ark:- |" - | \
+      gmm-global-est --mix-up=\$sil_num_gauss $dir/\$utt_id.silence.\$x.mdl \
+      - $dir/\$utt_id.silence.\$[x+1].mdl || exit 1
+
+    #objf_impr=\$(cat $dir/log/update.\$utt_id.\$x.log | grep "GMM update: Overall .* objective function" | perl -pe 's/.*GMM update: Overall (\S+) objective function .*/\$1/')
+    #
+    #if [ "\$(perl -e "if (\$objf_impr < $impr_thres) { print true; }")" == true ]; then
+    #  break;
+    #fi
     x=\$[x+1]
   done
 
   rm -f $dir/\$utt_id.final.mdl 2>/dev/null || true
-  cp $dir/\$utt_id.\$x.mdl $dir/\$utt_id.final.mdl 
+  #cp $dir/\$utt_id.\$x.mdl $dir/\$utt_id.final.mdl 
 
   (
   copy-transition-model --binary=false $dir/trans_test.mdl -
-  gmm-copy --write-tm=false --binary=false $dir/\$utt_id.\$x.mdl -
+  echo "<DIMENSION> $feat_dim <NUMPDFS> 2"
+  gmm-global-copy --binary=false $dir/\$utt_id.silence.\$x.mdl -
+  gmm-global-copy --binary=false $dir/\$utt_id.speech.\$x.mdl -
   ) | gmm-copy - $dir/\$utt_id.final.mdl
-  
-  #gmm-decode-simple \
-  #  --allow-partial=true --word-symbol-table=$dir/graph/words.txt \
-  #  $dir/\$utt_id.final.mdl $dir/graph/HCLG.fst \
-  #  "\$feats" ark:/dev/null ark:$dir/\$utt_id.final.ali || exit 1
   
   gmm-decode-simple \
     --allow-partial=true --word-symbol-table=$dir/graph/words.txt \

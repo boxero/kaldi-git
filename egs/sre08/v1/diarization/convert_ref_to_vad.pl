@@ -3,6 +3,7 @@
 # Apache 2.0.
 
 use strict;
+use POSIX;
 use Getopt::Long;
 use File::Basename;
 
@@ -32,7 +33,7 @@ my $max_time = 0;
 while (<IN>) {
   chomp;
   my @A = split;
-  if (int($A[1]/$frame_shift+0.5) > $max_time) { $max_time = int($A[1]/$frame_shift+0.5) }
+  if (floor($A[1]/$frame_shift+0.5) > $max_time) { $max_time = floor($A[1]/$frame_shift+0.5) }
 }
 
 my @vad = (1)x$max_time;
@@ -45,7 +46,7 @@ while (<IN>) {
   chomp;
   my @A = split;
 
-  for (my $i = int($A[0]/$frame_shift); $i <= int($A[1]/$frame_shift+0.5); $i++) {
+  for (my $i = floor($A[0]/$frame_shift); $i < floor($A[1]/$frame_shift+0.5) && $i < $max_time; $i++) {
     $vad[$i] = 2;
   }
 }

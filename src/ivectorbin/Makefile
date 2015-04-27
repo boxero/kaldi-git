@@ -6,16 +6,15 @@ include ../kaldi.mk
 
 BINFILES = ivector-extractor-init ivector-extractor-acc-stats \
            ivector-extractor-sum-accs ivector-extractor-est \
-           ivector-extract compute-vad select-voiced-frames \
+           ivector-extract \
            ivector-normalize-length \
            ivector-transform ivector-compute-dot-products ivector-mean \
            ivector-compute-lda ivector-compute-plda \
 	       ivector-copy-plda compute-eer \
            ivector-subtract-global-mean ivector-plda-scoring \
            logistic-regression-train logistic-regression-eval \
-           logistic-regression-copy create-split-from-vad \
-           ivector-extract-online ivector-adapt-plda \
-					 select-top-frames
+           logistic-regression-copy \
+           ivector-extract-online ivector-adapt-plda
 
 OBJFILES =
 

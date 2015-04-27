@@ -92,7 +92,7 @@ if (@ARGV != 0) {
   exit 1;
 }
 
-($silence_proportion > 0.01 && $silence_proportion < 0.99) ||
+($silence_proportion > 0.000001 && $silence_proportion < 0.99) ||
   die "Invalid silence-proportion value '$silence_proportion'";
 ($frame_shift > 0.0001 && $frame_shift <= 1.0) ||
   die "Very strange frame-shift value '$frame_shift'";
